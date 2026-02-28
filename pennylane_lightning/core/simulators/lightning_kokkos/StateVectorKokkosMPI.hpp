@@ -225,7 +225,7 @@ class StateVectorKokkosMPI final
                          const Kokkos::InitializationSettings &kokkos_args = {},
                          const MPI_Comm &communicator = MPI_COMM_WORLD)
         : StateVectorKokkosMPI(num_global_qubits, num_local_qubits,
-                               communicator) {
+                               communicator, kokkos_args) {
         PL_ABORT_IF_NOT(
             exp2(num_qubits_) == length,
             "length of complex data does not match the number of qubits");

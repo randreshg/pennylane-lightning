@@ -25,10 +25,20 @@
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Error.hpp"
 #include "MPIManager.hpp"
+
+#ifdef _ENABLE_PLKOKKOS_KOKKOSCOMM
+#include <KokkosComm/KokkosComm.hpp>
+#endif
+
+#if defined(_ENABLE_PLKOKKOS_KOKKOSCOMM) &&                                  \
+    (defined(KOKKOSCOMM_ENABLE_NCCL) || defined(KOKKOSCOMM_ENABLE_RCCL))
+#define PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND 1
+#endif
 
 /// @cond DEV
 namespace {
@@ -85,9 +95,38 @@ class MPIManagerKokkos final : public MPIManager {
 
   public:
     MPIManagerKokkos(MPI_Comm communicator = MPI_COMM_WORLD)
-        : MPIManager(communicator) {}
+        : MPIManager(communicator) {
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+        initGpuComm();
+#endif
+    }
 
-    MPIManagerKokkos(int argc, char **argv) : MPIManager(argc, argv) {}
+    MPIManagerKokkos(int argc, char **argv) : MPIManager(argc, argv) {
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+        initGpuComm();
+#endif
+    }
+
+    // Note: initGpuComm() is a collective operation (MPI_Bcast +
+    // ncclCommInitRank). All ranks must participate when copying.
+    MPIManagerKokkos(const MPIManagerKokkos &other)
+        : MPIManager(other),
+          cpp_mpi_type_map_with_kokkos(other.cpp_mpi_type_map_with_kokkos) {
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+        initGpuComm();
+#endif
+    }
+
+    ~MPIManagerKokkos() {
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+        if (gpu_comm_initialized_) {
+            ncclCommDestroy(gpu_comm_);
+        }
+#endif
+    }
+
+    auto operator=(const MPIManagerKokkos &) -> MPIManagerKokkos & = delete;
+    auto operator=(MPIManagerKokkos &&) -> MPIManagerKokkos & = delete;
 
     using MPIManager::Bcast;
 
@@ -106,6 +145,32 @@ class MPIManagerKokkos final : public MPIManager {
     void Sendrecv(Kokkos::View<T *> &sendBuf, std::size_t dest,
                   Kokkos::View<T *> &recvBuf, std::size_t source,
                   std::size_t size, std::size_t tag = 0) {
+#ifdef _ENABLE_PLKOKKOS_KOKKOSCOMM
+        // KokkosComm path: uses send+recv which can go through
+        // NCCL/RCCL on GPU backends for direct device-to-device transfers.
+        // Note: KokkosComm operates on full views. Create subviews for
+        // the requested size if it differs from the view extent.
+        // Note: NCCL/RCCL point-to-point operations don't support tags.
+        // The tag parameter is only used in the MPI fallback path.
+        static_cast<void>(tag);
+        using exec_space = Kokkos::DefaultExecutionSpace;
+        auto handle = KokkosComm::Handle<exec_space,
+                          KokkosComm::DefaultCommunicationSpace>(
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+            gpu_comm_
+#else
+            this->getComm()
+#endif
+                          );
+        auto sv =
+            Kokkos::subview(sendBuf, Kokkos::make_pair(std::size_t{0}, size));
+        auto rv =
+            Kokkos::subview(recvBuf, Kokkos::make_pair(std::size_t{0}, size));
+        auto send_req = KokkosComm::send(handle, sv, static_cast<int>(dest));
+        auto recv_req = KokkosComm::recv(handle, rv, static_cast<int>(source));
+        KokkosComm::wait(std::move(send_req));
+        KokkosComm::wait(std::move(recv_req));
+#else
         MPI_Datatype datatype = getMPIDatatype<T>();
         MPI_Status status;
         int sendtag = static_cast<int>(tag);
@@ -116,6 +181,7 @@ class MPIManagerKokkos final : public MPIManager {
         PL_MPI_IS_SUCCESS(MPI_Sendrecv(
             sendBuf.data(), sizeInt, datatype, destInt, sendtag, recvBuf.data(),
             sizeInt, datatype, sourceInt, recvtag, this->getComm(), &status));
+#endif
     }
 
     /**
@@ -148,10 +214,51 @@ class MPIManagerKokkos final : public MPIManager {
      */
     template <typename T>
     void Bcast(Kokkos::View<T *> &sendBuf, std::size_t root) {
+#ifdef _ENABLE_PLKOKKOS_KOKKOSCOMM
+        using exec_space = Kokkos::DefaultExecutionSpace;
+        auto handle = KokkosComm::Handle<exec_space,
+                          KokkosComm::DefaultCommunicationSpace>(
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+            gpu_comm_
+#else
+            this->getComm()
+#endif
+                          );
+        auto req = KokkosComm::Experimental::broadcast(handle, sendBuf,
+                                                       static_cast<int>(root));
+        KokkosComm::wait(std::move(req));
+#else
         MPI_Datatype datatype = getMPIDatatype<T>();
         int rootInt = static_cast<int>(root);
         PL_MPI_IS_SUCCESS(MPI_Bcast(sendBuf.data(), sendBuf.size(), datatype,
                                     rootInt, this->getComm()));
+#endif
     }
+
+  private:
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+    ncclComm_t gpu_comm_{};
+    bool gpu_comm_initialized_{false};
+
+    void initGpuComm() {
+        int n_ranks;
+        int my_rank;
+        PL_MPI_IS_SUCCESS(MPI_Comm_size(this->getComm(), &n_ranks));
+        PL_MPI_IS_SUCCESS(MPI_Comm_rank(this->getComm(), &my_rank));
+
+        ncclUniqueId id;
+        if (my_rank == 0) {
+            ncclResult_t res = ncclGetUniqueId(&id);
+            PL_ABORT_IF(res != ncclSuccess, ncclGetErrorString(res));
+        }
+        PL_MPI_IS_SUCCESS(
+            MPI_Bcast(&id, sizeof(ncclUniqueId), MPI_BYTE, 0, this->getComm()));
+        ncclResult_t res = ncclCommInitRank(&gpu_comm_, n_ranks, id, my_rank);
+        PL_ABORT_IF(res != ncclSuccess, ncclGetErrorString(res));
+        gpu_comm_initialized_ = true;
+    }
+#endif
 };
 } // namespace Pennylane::LightningKokkos::Util
+
+#undef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
