@@ -59,7 +59,9 @@ inline auto axpy_Kokkos(Kokkos::complex<PrecisionT> alpha,
                         Kokkos::View<Kokkos::complex<PrecisionT> *> x,
                         Kokkos::View<Kokkos::complex<PrecisionT> *> y,
                         std::size_t length) {
-    Kokkos::parallel_for(RangePolicy<>(0, length),
+    using ExecutionSpace =
+        typename Kokkos::View<Kokkos::complex<PrecisionT> *>::execution_space;
+    Kokkos::parallel_for(RangePolicy<ExecutionSpace>(0, length),
                          axpy_KokkosFunctor<PrecisionT>(alpha, x, y));
 }
 
@@ -139,7 +141,8 @@ void SparseMV_Kokkos(Kokkos::View<ComplexT *> x, Kokkos::View<ComplexT *> y,
                       ConstSizeTHostView(column_idx_ptr, numNNZ));
     Kokkos::deep_copy(kok_row_map, ConstSizeTHostView(row_map, row_map_size));
 
-    Kokkos::parallel_for(RangePolicy<>(0, row_map_size - 1),
+    using ExecutionSpace = typename KokkosVector::execution_space;
+    Kokkos::parallel_for(RangePolicy<ExecutionSpace>(0, row_map_size - 1),
                          SparseMV_KokkosFunctor<PrecisionT>(
                              x, y, kok_data, kok_column_idx_ptr, kok_row_map));
 }
@@ -181,8 +184,10 @@ getRealOfComplexInnerProduct(Kokkos::View<Kokkos::complex<PrecisionT> *> x,
     -> PrecisionT {
     PL_ASSERT(x.size() == y.size());
     PrecisionT inner = 0;
+    using ExecutionSpace =
+        typename Kokkos::View<Kokkos::complex<PrecisionT> *>::execution_space;
     Kokkos::parallel_reduce(
-        RangePolicy<>(0, x.size()),
+        RangePolicy<ExecutionSpace>(0, x.size()),
         getRealOfComplexInnerProductFunctor<PrecisionT>(x, y), inner);
     return inner;
 }
@@ -224,8 +229,10 @@ getImagOfComplexInnerProduct(Kokkos::View<Kokkos::complex<PrecisionT> *> x,
     -> PrecisionT {
     PL_ASSERT(x.size() == y.size());
     PrecisionT inner = 0;
+    using ExecutionSpace =
+        typename Kokkos::View<Kokkos::complex<PrecisionT> *>::execution_space;
     Kokkos::parallel_reduce(
-        RangePolicy<>(0, x.size()),
+        RangePolicy<ExecutionSpace>(0, x.size()),
         getImagOfComplexInnerProductFunctor<PrecisionT>(x, y), inner);
     return inner;
 }

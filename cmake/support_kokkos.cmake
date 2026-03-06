@@ -104,3 +104,10 @@ macro(findMPI_LK external_libs)
         target_link_libraries(${external_libs} INTERFACE MPI::MPI_CXX)
     endif()
 endmacro()
+
+# Macro to require and link KokkosComm.
+macro(findKokkosComm_LK external_libs)
+    find_package(KokkosComm REQUIRED)
+    message(STATUS "KokkosComm found.")
+    target_link_libraries(${external_libs} INTERFACE KokkosComm::KokkosComm)
+endmacro()

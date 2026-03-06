@@ -117,6 +117,7 @@ Homepage = "https://github.com/PennyLaneAI/pennylane-lightning"
 
 [project.entry-points."pennylane.plugins"]
 "lightning.qubit" = "pennylane_lightning.lightning_qubit:LightningQubit"
+"lightning.kokkos" = "pennylane_lightning.lightning_kokkos:LightningKokkos"
 
 [tool.bandit]
 targets = "pennylane_lightning"

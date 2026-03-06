@@ -17,9 +17,11 @@
  */
 
 #pragma once
+#include <algorithm>
 #include <complex>
 #include <cstddef>
 #include <cstdlib>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -106,6 +108,101 @@ class StateVectorKokkosMPI final
     std::vector<std::size_t> mpi_rank_to_global_index_map_;
     std::vector<std::size_t> global_wires_;
     std::vector<std::size_t> local_wires_;
+
+    bool useHighInitialGlobalWires() const {
+        const char *mode = std::getenv("PLKOKKOS_INITIAL_GLOBAL_WIRES");
+        if (mode == nullptr) {
+            return false;
+        }
+        const std::string value(mode);
+        return value == "high" || value == "last" || value == "msb";
+    }
+
+    bool globalWireIsOne(const std::size_t wire) const {
+        const std::size_t global_index =
+            getGlobalIndexFromMPIRank(mpi_manager_.getRank());
+        return ((global_index >> getRevGlobalWireIndex(wire)) &
+                std::size_t{1}) != 0;
+    }
+
+    void applyRankLocalGlobalPhase(bool inverse,
+                                   const std::vector<fp_t> &params) {
+        const fp_t phase = inverse ? -params[0] : params[0];
+        (*sv_).applyOperation("GlobalPhase", {}, false, {phase});
+    }
+
+    bool applyDistributedPhaseShiftNoSwap(
+        const std::string &opName, const std::vector<std::size_t> &wires,
+        bool inverse, const std::vector<fp_t> &params) {
+        if (opName == "PhaseShift" && wires.size() == 1 &&
+            isWiresGlobal(wires)) {
+            if (globalWireIsOne(wires[0])) {
+                applyRankLocalGlobalPhase(inverse, params);
+            }
+            return true;
+        }
+
+        if (opName != "ControlledPhaseShift" || wires.size() != 2) {
+            return false;
+        }
+
+        const auto global_wires = findGlobalWires(wires);
+        if (global_wires.empty()) {
+            return false;
+        }
+
+        if (global_wires.size() == 2) {
+            if (globalWireIsOne(global_wires[0]) &&
+                globalWireIsOne(global_wires[1])) {
+                applyRankLocalGlobalPhase(inverse, params);
+            }
+            return true;
+        }
+
+        const auto local_wires = findLocalWires(wires);
+        PL_ABORT_IF_NOT(local_wires.size() == 1,
+                        "ControlledPhaseShift expects exactly two wires.");
+        if (globalWireIsOne(global_wires[0])) {
+            (*sv_).applyOperation("PhaseShift", getLocalWireIndices(local_wires),
+                                  inverse, params);
+        }
+        return true;
+    }
+
+    void applyLocalWireSwap(const std::size_t wire0,
+                            const std::size_t wire1) {
+        (*sv_).applyOperation("SWAP",
+                              {getLocalWireIndex(wire0),
+                               getLocalWireIndex(wire1)},
+                              false);
+    }
+
+    void applyLazyWireSwap(const std::vector<std::size_t> &wires) {
+        PL_ABORT_IF_NOT(wires.size() == 2, "SWAP expects two wires.");
+        if (wires[0] == wires[1]) {
+            return;
+        }
+
+        const bool wire0_global = isWiresGlobal({wires[0]});
+        const bool wire1_global = isWiresGlobal({wires[1]});
+
+        if (wire0_global && wire1_global) {
+            std::swap(global_wires_[getGlobalWireIndex(wires[0])],
+                      global_wires_[getGlobalWireIndex(wires[1])]);
+            return;
+        }
+
+        if (!wire0_global && !wire1_global) {
+            std::swap(local_wires_[getLocalWireIndex(wires[0])],
+                      local_wires_[getLocalWireIndex(wires[1])]);
+            return;
+        }
+
+        const std::size_t global_wire = wire0_global ? wires[0] : wires[1];
+        const std::size_t local_wire = wire0_global ? wires[1] : wires[0];
+        std::swap(global_wires_[getGlobalWireIndex(global_wire)],
+                  local_wires_[getLocalWireIndex(local_wire)]);
+    }
 
   public:
     StateVectorKokkosMPI() = delete;
@@ -230,7 +327,7 @@ class StateVectorKokkosMPI final
                          const Kokkos::InitializationSettings &kokkos_args = {},
                          const MPI_Comm &communicator = MPI_COMM_WORLD)
         : StateVectorKokkosMPI(num_global_qubits, num_local_qubits,
-                               communicator) {
+                               communicator, kokkos_args) {
         PL_ABORT_IF_NOT(
             exp2(num_qubits_) == length,
             "length of complex data does not match the number of qubits");
@@ -360,9 +457,15 @@ class StateVectorKokkosMPI final
      *
      */
     void resetIndices() {
-        std::iota(global_wires_.begin(), global_wires_.end(), 0);
-        std::iota(local_wires_.begin(), local_wires_.end(),
-                  getNumGlobalWires());
+        if (useHighInitialGlobalWires()) {
+            std::iota(global_wires_.begin(), global_wires_.end(),
+                      getNumLocalWires());
+            std::iota(local_wires_.begin(), local_wires_.end(), 0);
+        } else {
+            std::iota(global_wires_.begin(), global_wires_.end(), 0);
+            std::iota(local_wires_.begin(), local_wires_.end(),
+                      getNumGlobalWires());
+        }
         std::iota(mpi_rank_to_global_index_map_.begin(),
                   mpi_rank_to_global_index_map_.end(), 0);
     }
@@ -381,8 +484,8 @@ class StateVectorKokkosMPI final
      * @param global_index Index of the target element.
      */
     void setBasisState(std::size_t global_index) {
-        const auto index = global2localIndex(global_index);
         resetIndices();
+        const auto index = global2localIndex(global_index);
         const auto rank = mpi_manager_.getRank();
         if (index.first == rank) {
             (*sv_).setBasisState(index.second);
@@ -522,8 +625,24 @@ class StateVectorKokkosMPI final
     global2localIndex(const std::size_t index) const {
         PL_ABORT_IF_NOT(index < exp2(this->getNumQubits()),
                         "Index out of bounds.");
-        auto blk = getLocalBlockSize();
-        return std::pair<std::size_t, std::size_t>{index / blk, index % blk};
+        std::size_t global_index = 0;
+        for (std::size_t wire : global_wires_) {
+            const std::size_t bit =
+                (index >> (this->getNumQubits() - 1 - wire)) &
+                std::size_t{1};
+            global_index |= bit << getRevGlobalWireIndex(wire);
+        }
+
+        std::size_t local_index = 0;
+        for (std::size_t wire : local_wires_) {
+            const std::size_t bit =
+                (index >> (this->getNumQubits() - 1 - wire)) &
+                std::size_t{1};
+            local_index |= bit << getRevLocalWireIndex(wire);
+        }
+
+        return std::pair<std::size_t, std::size_t>{
+            getMPIRankFromGlobalIndex(global_index), local_index};
     }
 
     std::size_t getGlobalIndexFromMPIRank(const int mpi_rank) const {
@@ -926,8 +1045,7 @@ class StateVectorKokkosMPI final
     void matchLocalWires(const std::vector<std::size_t> &other_local_wires) {
         for (std::size_t i = 0; i < local_wires_.size(); ++i) {
             if (local_wires_[i] != other_local_wires[i]) {
-                applyOperation("SWAP", {local_wires_[i], other_local_wires[i]},
-                               false);
+                applyLocalWireSwap(local_wires_[i], other_local_wires[i]);
                 local_wires_[getElementIndexInVector(
                     local_wires_, other_local_wires[i])] = local_wires_[i];
                 local_wires_[i] = other_local_wires[i];
@@ -1045,8 +1163,21 @@ class StateVectorKokkosMPI final
         }
 
         if (opName == "GlobalPhase") {
-            (*sv_).applyOperation("GlobalPhase", {}, inverse, {params});
+            (*sv_).applyOperation("GlobalPhase", {}, inverse, params);
             return;
+        }
+
+        if (opName == "SWAP") {
+            applyLazyWireSwap(wires);
+            return;
+        }
+
+        if (opName == "PhaseShift" || opName == "ControlledPhaseShift") {
+            PL_ABORT_IF(params.empty(), "Phase gate requires one parameter.");
+            if (applyDistributedPhaseShiftNoSwap(opName, wires, inverse,
+                                                 params)) {
+                return;
+            }
         }
 
         if (isWiresGlobal(wires)) {
@@ -1504,11 +1635,15 @@ class StateVectorKokkosMPI final
         for (std::size_t i = 0; i < getNumLocalWires(); ++i) {
             std::size_t wire_i = i + getNumGlobalWires();
             if (local_wires_[i] > wire_i) {
-                applyOperation("SWAP", {local_wires_[i], wire_i}, false);
+                applyLocalWireSwap(local_wires_[i], wire_i);
+                local_wires_[getElementIndexInVector(local_wires_, wire_i)] =
+                    local_wires_[i];
+                local_wires_[i] = wire_i;
             }
         }
-        std::iota(local_wires_.begin(), local_wires_.end(),
-                  getNumGlobalWires());
+        PL_ABORT_IF_NOT(
+            std::is_sorted(local_wires_.begin(), local_wires_.end()),
+            "local wires must be sorted after reordering.");
     }
 
     /**

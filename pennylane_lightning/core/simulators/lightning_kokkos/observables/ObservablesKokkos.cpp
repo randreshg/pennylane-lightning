@@ -17,6 +17,11 @@
 
 using namespace Pennylane::LightningKokkos;
 
+// This translation unit is compiled by hipcc for Kokkos HIP. These observable
+// template explicit instantiations own host-only STL containers, so do not force
+// them through HIP device compilation. Header-defined templates remain available
+// to host-side bindings and runtime call sites.
+#if !defined(__HIPCC__)
 template class Observables::NamedObs<StateVectorKokkos<float>>;
 template class Observables::NamedObs<StateVectorKokkos<double>>;
 
@@ -31,3 +36,4 @@ template class Observables::Hamiltonian<StateVectorKokkos<double>>;
 
 template class Observables::SparseHamiltonian<StateVectorKokkos<float>>;
 template class Observables::SparseHamiltonian<StateVectorKokkos<double>>;
+#endif

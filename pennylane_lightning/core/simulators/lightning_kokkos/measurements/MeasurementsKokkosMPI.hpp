@@ -122,6 +122,34 @@ class MeasurementsMPI final
      */
     PrecisionT expval(const std::string &operation,
                       const std::vector<size_t> &wires) {
+        if (operation == "Identity") {
+            return PrecisionT{1.0};
+        }
+
+        if (operation == "PauliZ" && wires.size() == 1 &&
+            this->_statevector.isWiresGlobal(wires)) {
+            auto sv_view = this->_statevector.getView();
+            PrecisionT local_norm = 0.0;
+            Kokkos::parallel_reduce(
+                RangePolicy<KokkosExecSpace>(0, sv_view.size()),
+                KOKKOS_LAMBDA(std::size_t i, PrecisionT &sum) {
+                    const PrecisionT norm = Kokkos::abs(sv_view(i));
+                    sum += norm * norm;
+                },
+                local_norm);
+
+            const std::size_t global_index =
+                this->_statevector.getGlobalIndexFromMPIRank(
+                    mpi_manager_.getRank());
+            const bool bit_is_one =
+                ((global_index >>
+                  this->_statevector.getRevGlobalWireIndex(wires[0])) &
+                 std::size_t{1}) != 0;
+            const PrecisionT signed_local_norm =
+                bit_is_one ? -local_norm : local_norm;
+            return this->_statevector.allReduceSum(signed_local_norm);
+        }
+
         if (!(this->_statevector.isWiresLocal(wires))) {
             auto global_wires_to_swap =
                 this->_statevector.findGlobalWires(wires);

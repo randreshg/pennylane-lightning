@@ -30,7 +30,18 @@ if not ld._CPP_BINARY_AVAILABLE:
 
 
 def test_create_device():
-    if MPI.COMM_WORLD.Get_size() > 2:
+    node_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+    procs_per_node = node_comm.Get_size()
+    node_comm.Free()
+
+    if device_name == "lightning.gpu":
+        from pennylane_lightning.lightning_gpu._gpu_dtype import DevPool
+
+        gpus_per_node = DevPool().getTotalDevices()
+    else:
+        gpus_per_node = procs_per_node
+
+    if procs_per_node > gpus_per_node:
         with pytest.raises(
             ValueError,
             match="Number of devices should be larger than or equal to the number of processes on each node.",

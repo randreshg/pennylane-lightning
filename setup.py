@@ -52,6 +52,11 @@ except TypeError:
 backend = project_name.replace("pennylane_", "").lower()
 if (backend == "lightning"): backend = "lightning_qubit"
 
+if "CMAKE_ARGS" in os.environ:
+    for _arg in os.environ["CMAKE_ARGS"].split(" "):
+        if _arg.startswith("-DPL_BACKEND="):
+            backend = _arg.split("=", 1)[1]
+
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=""):
         Extension.__init__(self, name, sources=[])
@@ -80,7 +85,7 @@ class CMakeBuild(build_ext):
         super().finalize_options()
 
     def build_extension(self, ext: CMakeExtension):
-        self.build_temp = f"build_{backend}"
+        self.build_temp = os.environ.get("PL_BUILD_TEMP", f"build_{backend}")
         extdir = str(Path(self.get_ext_fullpath(ext.name)).parent.absolute())
         debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
         build_type = "Debug" if debug else "RelWithDebInfo"
@@ -171,13 +176,20 @@ class CMakeBuild(build_ext):
 with open(os.path.join("pennylane_lightning", "core", "_version.py"), encoding="utf-8") as f:
     version = f.readlines()[-1].split()[-1].strip("\"'")
 
-packages_list = ["pennylane_lightning." + backend]
-
-if backend == "lightning_qubit":
-    packages_list += ["pennylane_lightning.core", "pennylane_lightning.lightning_base"]
+packages_list = [
+    "pennylane_lightning." + backend,
+    "pennylane_lightning." + backend + ".*",
+    "pennylane_lightning.core",
+    "pennylane_lightning.core.*",
+    "pennylane_lightning.lightning_base",
+    "pennylane_lightning.lightning_base.*",
+]
 
 if backend == "lightning_amdgpu":
-    packages_list += ["pennylane_lightning.lightning_kokkos"]
+    packages_list += [
+        "pennylane_lightning.lightning_kokkos",
+        "pennylane_lightning.lightning_kokkos.*",
+    ]
 
 info = {
     "version": version,

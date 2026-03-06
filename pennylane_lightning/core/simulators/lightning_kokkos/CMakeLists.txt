@@ -30,12 +30,17 @@ set(CMAKE_SKIP_BUILD_RPATH FALSE)
 option(PLKOKKOS_ENABLE_NATIVE "Enable native CPU build tuning" OFF)
 option(PLKOKKOS_ENABLE_SANITIZER "Enable address sanitizer" OFF)
 option(PLKOKKOS_ENABLE_WARNINGS "Enable warnings" ON)
+option(PLKOKKOS_ENABLE_KOKKOSCOMM "Enable KokkosComm-backed communication manager" OFF)
 
 # Include macro and functions supporting Kokkos libraries.
 include("${pennylane_lightning_SOURCE_DIR}/cmake/support_kokkos.cmake")
 if(ENABLE_MPI)
     findMPI_LK(lightning_external_libs)
     target_compile_options(lightning_compile_options INTERFACE "-D_ENABLE_PLKOKKOS_MPI=1")
+    if(PLKOKKOS_ENABLE_KOKKOSCOMM)
+        findKokkosComm_LK(lightning_external_libs)
+        target_compile_options(lightning_compile_options INTERFACE "-D_ENABLE_PLKOKKOS_KOKKOSCOMM=1")
+    endif()
 endif()
 
 set(LKOKKOS_FILES   StateVectorKokkos.cpp
