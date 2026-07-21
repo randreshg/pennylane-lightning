@@ -360,7 +360,7 @@ class MPIManagerKokkos final : public MPIManager {
                 }
                 delete c;
                 if (stream) {
-                    hipStreamDestroy(stream);
+                    static_cast<void>(hipStreamDestroy(stream));
                 }
             });
 
