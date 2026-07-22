@@ -4,6 +4,9 @@
 
 <h3>Improvements 🛠</h3>
 
+- A new singleton class manages MPI initialization and finalization.
+  [(#1397)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1397)
+
 - The MPI send and receive buffer sizes for Lightning-Kokkos are now adjustable via the
   `comm_buffer_ratio` keyword argument.
   [(#1391)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1391)
@@ -16,16 +19,27 @@
 
 <h3>Breaking changes 💔</h3>
 
+- Python 3.11 is no longer supported. The minimum required Python version is now 3.12.
+  [(#1395)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1395)
+
 <h3>Deprecations 👋</h3>
 
 <h3>Documentation 📝</h3>
 
 <h3>Bug fixes 🐛</h3>
 
+- Fixed controlled-gate dispatch in Lightning-Kokkos, Lightning-GPU and Lightning-Tensor to read gate
+  parameters from the base operation instead of the `Controlled` wrapper, restoring compatibility with
+  PennyLane where `Controlled.parameters` now includes the control values.
+  [(#1405)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1405)
+
 - Fixed `qp.PauliRot` execution bug when handling identity Pauli word within the compilation pipeline.
   [(#1390)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1390)
 
 <h3>Internal changes ⚙️</h3>
+
+- Upgrade Mac runner to macos-15.
+  [(#1394)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1394)
 
 - Updated Sphinx to version 9.0.
   [(#1393)](https://github.com/PennyLaneAI/pennylane-lightning/pull/1393)
@@ -57,6 +71,7 @@
 This release contains contributions from (in alphabetical order):
 
 Runor Agbaire,
+Yushao Chen,
 Jeffrey Kam,
 Joseph Lee,
 Jake Zaia
