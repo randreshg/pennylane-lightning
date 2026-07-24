@@ -169,12 +169,6 @@ class MPIManagerKokkos final : public MPIManager {
 #endif
     }
 
-    MPIManagerKokkos(int argc, char **argv) : MPIManager(argc, argv) {
-#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
-        initGpuComm();
-#endif
-    }
-
     // Copy constructor shares GPU communicator via reference counting
     // instead of re-initializing (which would cause deadlock)
     MPIManagerKokkos(const MPIManagerKokkos &other)
@@ -203,6 +197,7 @@ class MPIManagerKokkos final : public MPIManager {
     auto operator=(MPIManagerKokkos &&) -> MPIManagerKokkos & = delete;
 
     using MPIManager::Bcast;
+    using MPIManager::MPIManager;
 
     /**
      * @brief MPI_Sendrecv wrapper for Kokkos::Views.
