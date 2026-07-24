@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <cmath>
 #include <complex>
 #include <limits> // numeric_limits
 #include <random>
@@ -1099,6 +1100,174 @@ TEMPLATE_TEST_CASE("Match wires", "[LKMPI]", double, float) {
               Approx(imag(swapped_sv[mpi_manager.getRank() * block_size + j])));
         CHECK(imag(local_sv_data[j]) == Approx(imag(local_sv1_data[j])));
     }
+}
+
+TEMPLATE_TEST_CASE("StateVectorKokkosMPI distributed-exchange metrics",
+                   "[LKMPI]", double, float) {
+    const std::size_t num_qubits = 5;
+    MPIManagerKokkos mpi_manager(MPI_COMM_WORLD);
+    REQUIRE(mpi_manager.getSize() == 4);
+
+    StateVectorKokkosMPI<TestType> uninstrumented_sv(mpi_manager, num_qubits);
+    CHECK(!uninstrumented_sv.isDistributedExchangeMetricsEnabled());
+    uninstrumented_sv.swapGlobalLocalWires({0}, {2});
+    const auto &uninstrumented_metrics =
+        uninstrumented_sv.getDistributedExchangeMetrics();
+    CHECK(uninstrumented_metrics.exchange_chunks == 0);
+    CHECK(uninstrumented_metrics.exchange_window_events == 0);
+    CHECK(uninstrumented_metrics.exchanged_elements_per_direction == 0);
+    CHECK(uninstrumented_metrics.pack_submissions == 0);
+    CHECK(uninstrumented_metrics.pre_communication_fence_calls == 0);
+    CHECK(uninstrumented_metrics.caller_pre_communication_fence_calls == 0);
+    CHECK(uninstrumented_metrics.mpi_manager_safety_fence_calls == 0);
+    CHECK(uninstrumented_metrics.grouped_p2p_submission_calls == 0);
+    CHECK(uninstrumented_metrics.nccl_group_end_calls == 0);
+    CHECK(uninstrumented_metrics.post_group_end_event_recapture_calls == 0);
+    CHECK(uninstrumented_metrics.communication_calls == 0);
+    CHECK(uninstrumented_metrics.unpack_submissions == 0);
+    CHECK(uninstrumented_metrics.post_unpack_fence_calls == 0);
+    CHECK(uninstrumented_metrics.pack_submit_seconds == 0.0);
+    CHECK(uninstrumented_metrics.exchange_window_seconds == 0.0);
+    CHECK(uninstrumented_metrics.exchange_window_residual_seconds == 0.0);
+    CHECK(uninstrumented_metrics
+              .exchange_window_residual_after_transport_submission_seconds ==
+          0.0);
+    CHECK(uninstrumented_metrics.pre_communication_fence_seconds == 0.0);
+    CHECK(uninstrumented_metrics.caller_pre_communication_fence_seconds ==
+          0.0);
+    CHECK(uninstrumented_metrics.mpi_manager_safety_fence_seconds == 0.0);
+    CHECK(uninstrumented_metrics.grouped_p2p_submission_seconds == 0.0);
+    CHECK(uninstrumented_metrics.nccl_group_end_seconds == 0.0);
+    CHECK(uninstrumented_metrics.post_group_end_event_recapture_seconds ==
+          0.0);
+    CHECK(uninstrumented_metrics.communication_wait_seconds == 0.0);
+    CHECK(uninstrumented_metrics.unpack_submit_seconds == 0.0);
+    CHECK(uninstrumented_metrics.post_unpack_fence_seconds == 0.0);
+    CHECK(uninstrumented_metrics.completed_exchange_records.empty());
+
+    StateVectorKokkosMPI<TestType> sv(mpi_manager, num_qubits);
+    const auto &initial_metrics = sv.getDistributedExchangeMetrics();
+    CHECK(initial_metrics.exchange_chunks == 0);
+    CHECK(initial_metrics.exchange_window_events == 0);
+    CHECK(initial_metrics.exchanged_elements_per_direction == 0);
+    CHECK(initial_metrics.pack_submissions == 0);
+    CHECK(initial_metrics.pre_communication_fence_calls == 0);
+    CHECK(initial_metrics.caller_pre_communication_fence_calls == 0);
+    CHECK(initial_metrics.mpi_manager_safety_fence_calls == 0);
+    CHECK(initial_metrics.grouped_p2p_submission_calls == 0);
+    CHECK(initial_metrics.nccl_group_end_calls == 0);
+    CHECK(initial_metrics.post_group_end_event_recapture_calls == 0);
+    CHECK(initial_metrics.communication_calls == 0);
+    CHECK(initial_metrics.unpack_submissions == 0);
+    CHECK(initial_metrics.post_unpack_fence_calls == 0);
+    CHECK(!sv.isDistributedExchangeMetricsEnabled());
+
+    sv.setDistributedExchangeMetricsEnabled(true);
+    CHECK(sv.isDistributedExchangeMetricsEnabled());
+    CHECK(sv.getDistributedExchangeMetrics().completed_exchange_records
+              .capacity() >=
+          StateVectorKokkosMPI<TestType>::MAX_DISTRIBUTED_EXCHANGE_RECORDS);
+    sv.resetDistributedExchangeMetrics();
+    sv.swapGlobalLocalWires({0}, {2});
+
+    const auto &metrics = sv.getDistributedExchangeMetrics();
+    // A one-wire swap on the four-rank, five-qubit fixture performs one
+    // exchange of half of its eight-element local state vector.
+    CHECK(metrics.exchange_chunks == 1);
+    CHECK(metrics.exchange_window_events == 1);
+    CHECK(metrics.exchanged_elements_per_direction == 4);
+    CHECK(metrics.pack_submissions == 1);
+    CHECK(metrics.pre_communication_fence_calls >= 1);
+    CHECK(metrics.caller_pre_communication_fence_calls == 1);
+    CHECK(metrics.mpi_manager_safety_fence_calls <= 1);
+    CHECK(metrics.pre_communication_fence_calls ==
+          metrics.caller_pre_communication_fence_calls +
+              metrics.mpi_manager_safety_fence_calls);
+    CHECK(metrics.communication_calls == 1);
+    CHECK(metrics.grouped_p2p_submission_calls ==
+          metrics.nccl_group_end_calls);
+    CHECK(metrics.nccl_group_end_calls ==
+          metrics.post_group_end_event_recapture_calls);
+    CHECK(metrics.grouped_p2p_submission_calls <=
+          metrics.communication_calls);
+    CHECK(metrics.unpack_submissions == 1);
+    CHECK(metrics.post_unpack_fence_calls == 1);
+    CHECK(metrics.pack_submit_seconds >= 0.0);
+    CHECK(metrics.exchange_window_seconds >= 0.0);
+    // The residual is window minus named phase timers. It is intentionally
+    // signed to preserve timer-resolution/rounding evidence.
+    CHECK(std::isfinite(metrics.exchange_window_residual_seconds));
+    CHECK(std::isfinite(
+        metrics.exchange_window_residual_after_transport_submission_seconds));
+    CHECK(metrics.pre_communication_fence_seconds >= 0.0);
+    CHECK(metrics.caller_pre_communication_fence_seconds >= 0.0);
+    CHECK(metrics.mpi_manager_safety_fence_seconds >= 0.0);
+    CHECK(metrics.pre_communication_fence_seconds ==
+          metrics.caller_pre_communication_fence_seconds +
+              metrics.mpi_manager_safety_fence_seconds);
+    CHECK(metrics.communication_wait_seconds >= 0.0);
+    CHECK(metrics.grouped_p2p_submission_seconds >= 0.0);
+    CHECK(metrics.nccl_group_end_seconds >= 0.0);
+    CHECK(metrics.post_group_end_event_recapture_seconds >= 0.0);
+    CHECK(metrics.exchange_window_residual_after_transport_submission_seconds ==
+          Approx(metrics.exchange_window_residual_seconds -
+                 metrics.grouped_p2p_submission_seconds -
+                 metrics.nccl_group_end_seconds -
+                 metrics.post_group_end_event_recapture_seconds));
+    CHECK(metrics.unpack_submit_seconds >= 0.0);
+    CHECK(metrics.post_unpack_fence_seconds >= 0.0);
+    REQUIRE(metrics.completed_exchange_records.size() == 1);
+    const auto &record = metrics.completed_exchange_records.front();
+    CHECK(record.sequence == 0);
+    CHECK(record.peer_rank != mpi_manager.getRank());
+    CHECK(record.send_rank == mpi_manager.getRank());
+    CHECK(record.send_rank != record.recv_rank);
+    CHECK(record.peer_rank == record.recv_rank);
+    CHECK(record.elements_per_direction == 4);
+    CHECK(record.grouped_p2p_submission_seconds >= 0.0);
+    CHECK(record.nccl_group_end_seconds >= 0.0);
+    CHECK(record.post_group_end_event_recapture_seconds >= 0.0);
+    CHECK(record.communication_wait_seconds ==
+          Approx(metrics.communication_wait_seconds));
+    CHECK(record.exchange_window_seconds ==
+          Approx(metrics.exchange_window_seconds));
+
+    sv.resetDistributedExchangeMetrics();
+    const auto &reset_metrics = sv.getDistributedExchangeMetrics();
+    CHECK(reset_metrics.exchange_chunks == 0);
+    CHECK(reset_metrics.exchange_window_events == 0);
+    CHECK(reset_metrics.exchanged_elements_per_direction == 0);
+    CHECK(reset_metrics.pack_submissions == 0);
+    CHECK(reset_metrics.pre_communication_fence_calls == 0);
+    CHECK(reset_metrics.caller_pre_communication_fence_calls == 0);
+    CHECK(reset_metrics.mpi_manager_safety_fence_calls == 0);
+    CHECK(reset_metrics.grouped_p2p_submission_calls == 0);
+    CHECK(reset_metrics.nccl_group_end_calls == 0);
+    CHECK(reset_metrics.post_group_end_event_recapture_calls == 0);
+    CHECK(reset_metrics.communication_calls == 0);
+    CHECK(reset_metrics.unpack_submissions == 0);
+    CHECK(reset_metrics.post_unpack_fence_calls == 0);
+    CHECK(reset_metrics.pack_submit_seconds == 0.0);
+    CHECK(reset_metrics.exchange_window_seconds == 0.0);
+    CHECK(reset_metrics.exchange_window_residual_seconds == 0.0);
+    CHECK(reset_metrics
+              .exchange_window_residual_after_transport_submission_seconds ==
+          0.0);
+    CHECK(reset_metrics.pre_communication_fence_seconds == 0.0);
+    CHECK(reset_metrics.caller_pre_communication_fence_seconds == 0.0);
+    CHECK(reset_metrics.mpi_manager_safety_fence_seconds == 0.0);
+    CHECK(reset_metrics.grouped_p2p_submission_seconds == 0.0);
+    CHECK(reset_metrics.nccl_group_end_seconds == 0.0);
+    CHECK(reset_metrics.post_group_end_event_recapture_seconds == 0.0);
+    CHECK(reset_metrics.communication_wait_seconds == 0.0);
+    CHECK(reset_metrics.unpack_submit_seconds == 0.0);
+    CHECK(reset_metrics.post_unpack_fence_seconds == 0.0);
+    CHECK(reset_metrics.completed_exchange_records.empty());
+    CHECK(reset_metrics.completed_exchange_records.capacity() >=
+          StateVectorKokkosMPI<TestType>::MAX_DISTRIBUTED_EXCHANGE_RECORDS);
+
+    sv.setDistributedExchangeMetricsEnabled(false);
+    CHECK(!sv.isDistributedExchangeMetricsEnabled());
 }
 
 // MPI helpers tests

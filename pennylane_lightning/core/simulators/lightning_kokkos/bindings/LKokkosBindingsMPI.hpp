@@ -101,6 +101,92 @@ void registerBackendSpecificStateVectorMethodsMPI(PyClass &pyclass) {
         nb::arg("comm_buffer_ratio") = StateVectorT::DEFAULT_COMM_BUFFER_RATIO);
     pyclass.def(nb::init<std::size_t, const InitializationSettings &>());
     pyclass.def("getCommBufferRatio", &StateVectorT::getCommBufferRatio);
+    pyclass.def(
+        "setDistributedExchangeMetricsEnabled",
+        &StateVectorT::setDistributedExchangeMetricsEnabled, nb::arg("enabled"),
+        "Enable or disable rank-local distributed-exchange instrumentation.");
+    pyclass.def(
+        "resetDistributedExchangeMetrics",
+        &StateVectorT::resetDistributedExchangeMetrics,
+        "Clear rank-local distributed-exchange timing and counters.");
+    pyclass.def(
+        "getDistributedExchangeMetrics",
+        [](const StateVectorT &sv) {
+            const auto &metrics = sv.getDistributedExchangeMetrics();
+            nb::dict result;
+            result["exchange_chunks"] = metrics.exchange_chunks;
+            result["exchange_window_events"] =
+                metrics.exchange_window_events;
+            result["exchanged_elements_per_direction"] =
+                metrics.exchanged_elements_per_direction;
+            result["pack_submissions"] = metrics.pack_submissions;
+            result["pre_communication_fence_calls"] =
+                metrics.pre_communication_fence_calls;
+            result["caller_pre_communication_fence_calls"] =
+                metrics.caller_pre_communication_fence_calls;
+            result["mpi_manager_safety_fence_calls"] =
+                metrics.mpi_manager_safety_fence_calls;
+            result["grouped_p2p_submission_calls"] =
+                metrics.grouped_p2p_submission_calls;
+            result["nccl_group_end_calls"] = metrics.nccl_group_end_calls;
+            result["post_group_end_event_recapture_calls"] =
+                metrics.post_group_end_event_recapture_calls;
+            result["communication_calls"] = metrics.communication_calls;
+            result["unpack_submissions"] = metrics.unpack_submissions;
+            result["post_unpack_fence_calls"] =
+                metrics.post_unpack_fence_calls;
+            result["pack_submit_seconds"] = metrics.pack_submit_seconds;
+            result["exchange_window_seconds"] =
+                metrics.exchange_window_seconds;
+            result["exchange_window_residual_seconds"] =
+                metrics.exchange_window_residual_seconds;
+            result["pre_communication_fence_seconds"] =
+                metrics.pre_communication_fence_seconds;
+            result["caller_pre_communication_fence_seconds"] =
+                metrics.caller_pre_communication_fence_seconds;
+            result["mpi_manager_safety_fence_seconds"] =
+                metrics.mpi_manager_safety_fence_seconds;
+            result["grouped_p2p_submission_seconds"] =
+                metrics.grouped_p2p_submission_seconds;
+            result["nccl_group_end_seconds"] =
+                metrics.nccl_group_end_seconds;
+            result["post_group_end_event_recapture_seconds"] =
+                metrics.post_group_end_event_recapture_seconds;
+            result["communication_wait_seconds"] =
+                metrics.communication_wait_seconds;
+            result["unpack_submit_seconds"] = metrics.unpack_submit_seconds;
+            result["post_unpack_fence_seconds"] =
+                metrics.post_unpack_fence_seconds;
+            result[
+                "exchange_window_residual_after_transport_submission_seconds"] =
+                metrics
+                    .exchange_window_residual_after_transport_submission_seconds;
+            nb::list exchange_records;
+            for (const auto &record : metrics.completed_exchange_records) {
+                nb::dict entry;
+                entry["sequence"] = record.sequence;
+                entry["peer_rank"] = record.peer_rank;
+                entry["send_rank"] = record.send_rank;
+                entry["recv_rank"] = record.recv_rank;
+                entry["elements_per_direction"] =
+                    record.elements_per_direction;
+                entry["tag"] = record.tag;
+                entry["grouped_p2p_submission_seconds"] =
+                    record.grouped_p2p_submission_seconds;
+                entry["nccl_group_end_seconds"] =
+                    record.nccl_group_end_seconds;
+                entry["post_group_end_event_recapture_seconds"] =
+                    record.post_group_end_event_recapture_seconds;
+                entry["communication_wait_seconds"] =
+                    record.communication_wait_seconds;
+                entry["exchange_window_seconds"] =
+                    record.exchange_window_seconds;
+                exchange_records.append(entry);
+            }
+            result["exchange_records"] = exchange_records;
+            return result;
+        },
+        "Return rank-local distributed-exchange timing and counters.");
 
     pyclass.def("resetStateVector", &StateVectorT::resetStateVector);
     pyclass.def(

@@ -19,7 +19,7 @@ interfaces with C++ for fast linear algebra calculations.
 from dataclasses import replace
 from functools import partial, reduce
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 from warnings import warn
 
 import numpy as np
@@ -215,6 +215,29 @@ class LightningKokkos(LightningBase):
         self.LightningStateVector = LightningKokkosStateVector
         self.LightningMeasurements = LightningKokkosMeasurements
         self.LightningAdjointJacobian = LightningKokkosAdjointJacobian
+
+    def set_distributed_exchange_metrics_enabled(self, enabled: bool) -> None:
+        """Enable or disable MPI distributed-exchange instrumentation.
+
+        The diagnostic is disabled by default. It is intentionally exposed as
+        an opt-in device method so benchmark payloads do not reach through
+        private state-vector fields.
+        """
+        if not self._mpi or self._statevector is None:
+            raise DeviceError("Distributed-exchange metrics require mpi=True.")
+        self._statevector.set_distributed_exchange_metrics_enabled(enabled)
+
+    def reset_distributed_exchange_metrics(self) -> None:
+        """Clear MPI distributed-exchange timing and counters."""
+        if not self._mpi or self._statevector is None:
+            raise DeviceError("Distributed-exchange metrics require mpi=True.")
+        self._statevector.reset_distributed_exchange_metrics()
+
+    def get_distributed_exchange_metrics(self) -> dict[str, Any]:
+        """Return rank-local MPI distributed-exchange timing, counters, and records."""
+        if not self._mpi or self._statevector is None:
+            raise DeviceError("Distributed-exchange metrics require mpi=True.")
+        return self._statevector.get_distributed_exchange_metrics()
 
     def setup_execution_config(
         self, config: ExecutionConfig | None = None, circuit: qp.tape.QuantumScript | None = None

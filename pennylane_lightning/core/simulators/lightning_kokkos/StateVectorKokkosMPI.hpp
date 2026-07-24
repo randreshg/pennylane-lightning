@@ -18,6 +18,7 @@
 
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <complex>
 #include <cstddef>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <Kokkos_Core.hpp>
@@ -94,11 +96,123 @@ class StateVectorKokkosMPI final
 
     using BaseType = StateVectorBase<fp_t, StateVectorKokkosMPI<fp_t>>;
 
+    /**
+     * @brief Accumulated host-side timings for distributed state exchange.
+     *
+     * Pack and unpack timings cover host submission of their asynchronous
+     * Kokkos kernels. Their device completion is deliberately attributed to
+     * the immediately following fence, avoiding double-counting in the phase
+     * total. The legacy `pre_communication_fence_seconds` and
+     * `pre_communication_fence_calls` fields are retained as their original
+     * aggregate: the caller-owned producer drain plus the MPIManager
+     * KokkosComm transport safety drain. The v3 attribution fields split
+     * those two existing fences without changing their ordering or scope.
+     * Because both are unscoped Kokkos fences, they are dependency/drain time
+     * and can include earlier queued QFT work; they are not a pack-completion
+     * or network metric.
+     * `communication_wait_seconds` covers rank-local end-to-end P2P
+     * completion after request submission. It can include peer-arrival skew,
+     * RCCL scheduling/progress, and data movement; it is not raw wire time or
+     * an achieved RoCE-bandwidth measurement. For exchange chunks with an
+     * existing post-unpack fence, `exchange_window_seconds` starts immediately
+     * before pack submission and ends after that fence. Its signed residual is
+     * the window minus the named phase timings, so it captures unclassified
+     * host submission/bookkeeping time rather than claiming extra transport
+     * time.
+     * The corresponding `*_submissions` and `*_calls` fields make each
+     * phase's accumulated timing auditable for chunked exchanges.
+     * v4 preserves every v3 field and its residual calculation. It adds the
+     * host-side grouped-P2P submission, GroupEnd, and post-GroupEnd request
+     * recapture timers plus a separate residual after those three terms; none
+     * of those host API times is a device or wire-transfer measurement.
+     *
+     * The counters are local to one MPI rank. A future benchmark must enable
+     * the hooks, reset before its measured region, and reduce rank-local
+     * values explicitly; there is intentionally no hidden collective in this
+     * instrumentation.
+     */
+    static constexpr std::size_t MAX_DISTRIBUTED_EXCHANGE_RECORDS = 40;
+
+    /**
+     * @brief One completed swapGlobalLocalWires exchange window.
+     *
+     * These records are deliberately emitted only after the existing
+     * post-unpack fence. matchGlobalWiresAndIndex has asynchronous-return
+     * semantics and must not be given an invented completion fence merely for
+     * instrumentation.
+     */
+    struct CompletedExchangeRecord {
+        std::size_t sequence{0};
+        // Record direction is local rank -> remote partner. This is an audit
+        // record, not a restatement of MPIManagerKokkos::Sendrecv's separate
+        // destination/source arguments (which are identical for this swap).
+        std::size_t peer_rank{0};
+        std::size_t send_rank{0};
+        std::size_t recv_rank{0};
+        std::size_t elements_per_direction{0};
+        std::size_t tag{0};
+        double grouped_p2p_submission_seconds{0.0};
+        double nccl_group_end_seconds{0.0};
+        double post_group_end_event_recapture_seconds{0.0};
+        double communication_wait_seconds{0.0};
+        double exchange_window_seconds{0.0};
+    };
+
+    struct DistributedExchangeMetrics {
+        std::size_t exchange_chunks{0};
+        std::size_t exchange_window_events{0};
+        std::size_t exchanged_elements_per_direction{0};
+        std::size_t pack_submissions{0};
+        std::size_t pre_communication_fence_calls{0};
+        std::size_t caller_pre_communication_fence_calls{0};
+        std::size_t mpi_manager_safety_fence_calls{0};
+        std::size_t grouped_p2p_submission_calls{0};
+        std::size_t nccl_group_end_calls{0};
+        std::size_t post_group_end_event_recapture_calls{0};
+        std::size_t communication_calls{0};
+        std::size_t unpack_submissions{0};
+        std::size_t post_unpack_fence_calls{0};
+        double pack_submit_seconds{0.0};
+        double exchange_window_seconds{0.0};
+        double exchange_window_residual_seconds{0.0};
+        double pre_communication_fence_seconds{0.0};
+        double caller_pre_communication_fence_seconds{0.0};
+        double mpi_manager_safety_fence_seconds{0.0};
+        double grouped_p2p_submission_seconds{0.0};
+        double nccl_group_end_seconds{0.0};
+        double post_group_end_event_recapture_seconds{0.0};
+        double communication_wait_seconds{0.0};
+        double unpack_submit_seconds{0.0};
+        double post_unpack_fence_seconds{0.0};
+        // Retains the v3 residual above unchanged, then accounts for the
+        // three v4 grouped-P2P host submission phases separately.
+        double exchange_window_residual_after_transport_submission_seconds{
+            0.0};
+        std::vector<CompletedExchangeRecord> completed_exchange_records{};
+
+        void reserveCompletedExchangeRecords() {
+            completed_exchange_records.reserve(
+                MAX_DISTRIBUTED_EXCHANGE_RECORDS);
+        }
+
+        void reset() {
+            // Retain the explicitly reserved record storage so an instrumented
+            // QNode cannot reallocate while its exchange windows are timed.
+            auto records = std::move(completed_exchange_records);
+            *this = {};
+            completed_exchange_records = std::move(records);
+            completed_exchange_records.clear();
+        }
+    };
+
   private:
     std::unique_ptr<SVK> sv_;
     std::shared_ptr<KokkosVector> recvbuf_;
     std::shared_ptr<KokkosVector> sendbuf_;
     MPIManagerKokkos mpi_manager_;
+
+    DistributedExchangeMetrics distributed_exchange_metrics_{};
+    bool distributed_exchange_metrics_enabled_{false};
 
     std::size_t comm_buffer_ratio_ = DEFAULT_COMM_BUFFER_RATIO;
 
@@ -108,6 +222,157 @@ class StateVectorKokkosMPI final
     std::vector<std::size_t> mpi_rank_to_global_index_map_;
     std::vector<std::size_t> global_wires_;
     std::vector<std::size_t> local_wires_;
+
+    using ExchangeClock = std::chrono::steady_clock;
+
+    static double elapsedSeconds(const ExchangeClock::time_point &start) {
+        return std::chrono::duration<double>(ExchangeClock::now() - start)
+            .count();
+    }
+
+    void recordPreCommunicationFence() {
+        if (!distributed_exchange_metrics_enabled_) {
+            Kokkos::fence();
+            return;
+        }
+        const auto start = ExchangeClock::now();
+        Kokkos::fence();
+        const double elapsed_seconds = elapsedSeconds(start);
+        distributed_exchange_metrics_.pre_communication_fence_calls++;
+        distributed_exchange_metrics_.caller_pre_communication_fence_calls++;
+        distributed_exchange_metrics_.pre_communication_fence_seconds +=
+            elapsed_seconds;
+        distributed_exchange_metrics_
+            .caller_pre_communication_fence_seconds += elapsed_seconds;
+    }
+
+    void recordPostUnpackFence() {
+        if (!distributed_exchange_metrics_enabled_) {
+            Kokkos::fence();
+            return;
+        }
+        const auto start = ExchangeClock::now();
+        Kokkos::fence();
+        distributed_exchange_metrics_.post_unpack_fence_calls++;
+        distributed_exchange_metrics_.post_unpack_fence_seconds +=
+            elapsedSeconds(start);
+    }
+
+    void recordSendrecvTiming(
+        const MPIManagerKokkos::SendrecvTiming &timing) {
+        distributed_exchange_metrics_.pre_communication_fence_calls +=
+            timing.pre_communication_fence_calls;
+        distributed_exchange_metrics_.mpi_manager_safety_fence_calls +=
+            timing.mpi_manager_safety_fence_calls;
+        distributed_exchange_metrics_.grouped_p2p_submission_calls +=
+            timing.grouped_p2p_submission_calls;
+        distributed_exchange_metrics_.nccl_group_end_calls +=
+            timing.nccl_group_end_calls;
+        distributed_exchange_metrics_.post_group_end_event_recapture_calls +=
+            timing.post_group_end_event_recapture_calls;
+        distributed_exchange_metrics_.communication_calls +=
+            timing.communication_calls;
+        distributed_exchange_metrics_.pre_communication_fence_seconds +=
+            timing.pre_communication_fence_seconds;
+        distributed_exchange_metrics_.mpi_manager_safety_fence_seconds +=
+            timing.mpi_manager_safety_fence_seconds;
+        distributed_exchange_metrics_.grouped_p2p_submission_seconds +=
+            timing.grouped_p2p_submission_seconds;
+        distributed_exchange_metrics_.nccl_group_end_seconds +=
+            timing.nccl_group_end_seconds;
+        distributed_exchange_metrics_
+            .post_group_end_event_recapture_seconds +=
+            timing.post_group_end_event_recapture_seconds;
+        distributed_exchange_metrics_.communication_wait_seconds +=
+            timing.communication_wait_seconds;
+    }
+
+    void recordCompletedExchangeChunk(const std::size_t elements) {
+        distributed_exchange_metrics_.exchange_chunks++;
+        distributed_exchange_metrics_.exchanged_elements_per_direction +=
+            elements;
+    }
+
+    static double namedPhaseSeconds(const DistributedExchangeMetrics &metrics) {
+        return metrics.pack_submit_seconds +
+               metrics.pre_communication_fence_seconds +
+               metrics.communication_wait_seconds +
+               metrics.unpack_submit_seconds +
+               metrics.post_unpack_fence_seconds;
+    }
+
+    static double transportSubmissionSeconds(
+        const DistributedExchangeMetrics &metrics) {
+        return metrics.grouped_p2p_submission_seconds +
+               metrics.nccl_group_end_seconds +
+               metrics.post_group_end_event_recapture_seconds;
+    }
+
+    double recordCompletedExchangeWindow(
+        const ExchangeClock::time_point &start,
+        const double named_phase_seconds_before,
+        const double transport_submission_seconds_before) {
+        const double window_seconds = elapsedSeconds(start);
+        const double phase_seconds =
+            namedPhaseSeconds(distributed_exchange_metrics_) -
+            named_phase_seconds_before;
+        distributed_exchange_metrics_.exchange_window_events++;
+        distributed_exchange_metrics_.exchange_window_seconds +=
+            window_seconds;
+        // This is deliberately signed. A near-zero negative value is possible
+        // from timer granularity/rounding; a material residual is unclassified
+        // host work between named phase timers, not a transport attribution.
+        distributed_exchange_metrics_.exchange_window_residual_seconds +=
+            window_seconds - phase_seconds;
+        const double transport_submission_seconds =
+            transportSubmissionSeconds(distributed_exchange_metrics_) -
+            transport_submission_seconds_before;
+        // Both scalar baselines were sampled at this completed-window start.
+        // Therefore this residual never subtracts submission phases from an
+        // earlier asynchronous matchGlobalWiresAndIndex call, which has no
+        // completed exchange window or record of its own.
+        distributed_exchange_metrics_
+            .exchange_window_residual_after_transport_submission_seconds +=
+            window_seconds - phase_seconds - transport_submission_seconds;
+        return window_seconds;
+    }
+
+    void recordCompletedExchangeRecord(
+        const std::size_t local_rank, const std::size_t peer_rank,
+        const std::size_t elements, const std::size_t tag,
+        const MPIManagerKokkos::SendrecvTiming &timing,
+        const double exchange_window_seconds) {
+        PL_ABORT_IF(
+            distributed_exchange_metrics_.completed_exchange_records.size() >=
+                MAX_DISTRIBUTED_EXCHANGE_RECORDS,
+            "Distributed-exchange diagnostic record capacity exceeded; "
+            "increase the bounded diagnostic contract before collecting more "
+            "completed exchange windows.");
+        distributed_exchange_metrics_.completed_exchange_records.push_back(
+            {distributed_exchange_metrics_.completed_exchange_records.size(),
+             peer_rank, local_rank, peer_rank, elements, tag,
+             timing.grouped_p2p_submission_seconds,
+             timing.nccl_group_end_seconds,
+             timing.post_group_end_event_recapture_seconds,
+             timing.communication_wait_seconds, exchange_window_seconds});
+    }
+
+    auto sendrecvAndRecordExchange(const std::size_t send_rank,
+                                   const std::size_t recv_rank,
+                                   const std::size_t size,
+                                   const std::size_t tag)
+        -> MPIManagerKokkos::SendrecvTiming {
+        MPIManagerKokkos::SendrecvTiming communication_timing{};
+        if (!distributed_exchange_metrics_enabled_) {
+            sendrecvBuffers(send_rank, recv_rank, size, tag);
+            return communication_timing;
+        }
+        sendrecvBuffers(send_rank, recv_rank, size, tag,
+                        &communication_timing);
+        recordSendrecvTiming(communication_timing);
+        recordCompletedExchangeChunk(size);
+        return communication_timing;
+    }
 
     bool useHighInitialGlobalWires() const {
         const char *mode = std::getenv("PLKOKKOS_INITIAL_GLOBAL_WIRES");
@@ -452,6 +717,41 @@ class StateVectorKokkosMPI final
     std::size_t getCommBufferRatio() const { return comm_buffer_ratio_; }
 
     /**
+     * @brief Return the rank-local distributed-exchange instrumentation.
+     *
+     * The returned values are accumulated since construction or the last call
+     * to resetDistributedExchangeMetrics().
+     */
+    const DistributedExchangeMetrics &getDistributedExchangeMetrics() const {
+        return distributed_exchange_metrics_;
+    }
+
+    /**
+     * @brief Enable or disable distributed-exchange instrumentation.
+     *
+     * Disabled is the default and retains the uninstrumented execution path.
+     * Disabling does not erase an already collected sample; call
+     * resetDistributedExchangeMetrics() when starting a new measured region.
+     */
+    void setDistributedExchangeMetricsEnabled(const bool enabled) {
+        distributed_exchange_metrics_enabled_ = enabled;
+        if (enabled) {
+            distributed_exchange_metrics_.reserveCompletedExchangeRecords();
+        }
+    }
+
+    bool isDistributedExchangeMetricsEnabled() const {
+        return distributed_exchange_metrics_enabled_;
+    }
+
+    /**
+     * @brief Clear rank-local distributed-exchange timing and counters.
+     */
+    void resetDistributedExchangeMetrics() {
+        distributed_exchange_metrics_.reset();
+    }
+
+    /**
      * @brief Reset the indices of the global_wires_, local_wires_ and
      *       the mpi_rank_to_global_index_map_.
      *
@@ -536,9 +836,10 @@ class StateVectorKokkosMPI final
      */
     void sendrecvBuffers(const std::size_t send_rank,
                          const std::size_t recv_rank, const std::size_t size,
-                         const std::size_t tag) {
+                         const std::size_t tag,
+                         MPIManagerKokkos::SendrecvTiming *timing = nullptr) {
         mpi_manager_.Sendrecv(*sendbuf_, send_rank, *recvbuf_, recv_rank, size,
-                              tag);
+                              tag, timing);
     }
     /********************
     Wires-related methods
@@ -950,7 +1251,28 @@ class StateVectorKokkosMPI final
                 const std::size_t csize =
                     std::min(chunk_size, send_size - offset);
 
+                // Snapshot only scalar phase totals. Copying the metrics
+                // object here would copy its bounded diagnostic record vector
+                // for every exchange and could allocate on the timed path.
+                const double named_phase_seconds_before =
+                    distributed_exchange_metrics_enabled_
+                        ? namedPhaseSeconds(distributed_exchange_metrics_)
+                        : 0.0;
+                const double transport_submission_seconds_before =
+                    distributed_exchange_metrics_enabled_
+                        ? transportSubmissionSeconds(
+                              distributed_exchange_metrics_)
+                        : 0.0;
+                const auto exchange_window_start =
+                    distributed_exchange_metrics_enabled_
+                        ? ExchangeClock::now()
+                        : ExchangeClock::time_point{};
+
                 // Copy to send buffer
+                const auto pack_submit_start =
+                    distributed_exchange_metrics_enabled_
+                        ? ExchangeClock::now()
+                        : ExchangeClock::time_point{};
                 Kokkos::parallel_for(
                     "copy_sendbuf", RangePolicy<KokkosExecSpace>(0, csize),
                     KOKKOS_LAMBDA(std::size_t buffer_index) {
@@ -964,13 +1286,24 @@ class StateVectorKokkosMPI final
                         }
                         sendbuf_view(buffer_index) = sv_view(SV_index);
                     });
-                Kokkos::fence();
+                if (distributed_exchange_metrics_enabled_) {
+                    distributed_exchange_metrics_.pack_submissions++;
+                    distributed_exchange_metrics_.pack_submit_seconds +=
+                        elapsedSeconds(pack_submit_start);
+                }
+                // This is an existing fence. Its duration includes completion
+                // of the asynchronously submitted pack kernel.
+                recordPreCommunicationFence();
 
                 // MPI Sendrecv
-                sendrecvBuffers(other_mpi_rank, other_mpi_rank, csize,
-                                batch_index);
+                const auto communication_timing = sendrecvAndRecordExchange(
+                    other_mpi_rank, other_mpi_rank, csize, batch_index);
 
                 // Copy from recv buffer
+                const auto unpack_submit_start =
+                    distributed_exchange_metrics_enabled_
+                        ? ExchangeClock::now()
+                        : ExchangeClock::time_point{};
                 Kokkos::parallel_for(
                     "copy_recvbuf", RangePolicy<KokkosExecSpace>(0, csize),
                     KOKKOS_LAMBDA(std::size_t buffer_index) {
@@ -984,7 +1317,24 @@ class StateVectorKokkosMPI final
                         }
                         sv_view(SV_index) = recvbuf_view(buffer_index);
                     });
-                Kokkos::fence();
+                if (distributed_exchange_metrics_enabled_) {
+                    distributed_exchange_metrics_.unpack_submissions++;
+                    distributed_exchange_metrics_.unpack_submit_seconds +=
+                        elapsedSeconds(unpack_submit_start);
+                }
+                // This is an existing fence. Its duration includes completion
+                // of the asynchronously submitted unpack kernel.
+                recordPostUnpackFence();
+                if (distributed_exchange_metrics_enabled_) {
+                    const double exchange_window_seconds =
+                        recordCompletedExchangeWindow(
+                            exchange_window_start, named_phase_seconds_before,
+                            transport_submission_seconds_before);
+                    recordCompletedExchangeRecord(
+                        mpi_manager_.getRank(), other_mpi_rank, csize,
+                        batch_index,
+                        communication_timing, exchange_window_seconds);
+                }
             }
         }
 
@@ -1096,22 +1446,47 @@ class StateVectorKokkosMPI final
              offset += chunk_size) {
             const std::size_t csize = std::min(chunk_size, total_size - offset);
             // COPY to buffer
+            const auto pack_submit_start =
+                distributed_exchange_metrics_enabled_
+                    ? ExchangeClock::now()
+                    : ExchangeClock::time_point{};
             Kokkos::parallel_for(
                 "copy_sendbuf", RangePolicy<KokkosExecSpace>(0, csize),
                 KOKKOS_LAMBDA(std::size_t buffer_index) {
                     sendbuf_view(buffer_index) = sv_view(buffer_index + offset);
                 });
-            Kokkos::fence();
+            if (distributed_exchange_metrics_enabled_) {
+                distributed_exchange_metrics_.pack_submissions++;
+                distributed_exchange_metrics_.pack_submit_seconds +=
+                    elapsedSeconds(pack_submit_start);
+            }
+            // This is an existing fence. Its duration includes completion of
+            // the asynchronously submitted pack kernel.
+            recordPreCommunicationFence();
             // SENDRECV
-            sendrecvBuffers(dest_mpi_rank, dest_mpi_rank, csize, 0);
+            sendrecvAndRecordExchange(dest_mpi_rank, dest_mpi_rank, csize, 0);
             // COPY FROM BUFFER
+            const auto unpack_submit_start =
+                distributed_exchange_metrics_enabled_
+                    ? ExchangeClock::now()
+                    : ExchangeClock::time_point{};
             Kokkos::parallel_for(
                 "copy_recvbuf", RangePolicy<KokkosExecSpace>(0, csize),
                 KOKKOS_LAMBDA(std::size_t buffer_index) {
                     sv_view(buffer_index + offset) = recvbuf_view(buffer_index);
                 });
+            if (distributed_exchange_metrics_enabled_) {
+                distributed_exchange_metrics_.unpack_submissions++;
+                distributed_exchange_metrics_.unpack_submit_seconds +=
+                    elapsedSeconds(unpack_submit_start);
+            }
         }
 
+        // Preserve this method's existing asynchronous-return behavior. Unlike
+        // swapGlobalLocalWires(), it did not fence after the unpack kernel, so
+        // no post-unpack fence or completed exchange-window event is inserted
+        // or recorded here. `exchange_window_events` can therefore be smaller
+        // than `exchange_chunks` for callers that use this method.
         // copy global_wires_target and mpi_rank_to_global_index_map_target
         global_wires_ = global_wires_target;
         mpi_rank_to_global_index_map_ = mpi_rank_to_global_index_map_target;

@@ -22,6 +22,10 @@
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+#include <hip/hip_runtime.h>
+#endif
+
 #include "MPIManagerKokkos.hpp"
 #include "UtilKokkos.hpp"
 
@@ -85,13 +89,45 @@ TEMPLATE_TEST_CASE("MPIManagerKokkos::Sendrecv", "[MPIManagerKokkos]", float,
         }
         Kokkos::View<cp_t *> sendBuf = vector2view(h_sendBuf);
         Kokkos::View<cp_t *> recvBuf("recvBuf", message_size);
-        mpi_manager.Sendrecv(sendBuf, dest, recvBuf, source, message_size);
+        MPIManagerKokkos::SendrecvTiming timing{};
+        mpi_manager.Sendrecv(sendBuf, dest, recvBuf, source, message_size, 0,
+                             &timing);
         auto h_recvBuf = view2vector(recvBuf);
 
         for (std::size_t i = 0; i < message_size; ++i) {
             CHECK(h_recvBuf[i].real() == static_cast<PrecisionT>(source + i));
             CHECK(h_recvBuf[i].imag() == static_cast<PrecisionT>(0));
         }
+        CHECK(timing.communication_calls == 1);
+        CHECK(timing.pre_communication_fence_calls <= 1);
+        CHECK(timing.mpi_manager_safety_fence_calls ==
+              timing.pre_communication_fence_calls);
+        CHECK(timing.pre_communication_fence_seconds >= 0.0);
+        CHECK(timing.mpi_manager_safety_fence_seconds ==
+              timing.pre_communication_fence_seconds);
+        CHECK(timing.grouped_p2p_submission_calls ==
+              timing.nccl_group_end_calls);
+        CHECK(timing.nccl_group_end_calls ==
+              timing.post_group_end_event_recapture_calls);
+        CHECK(timing.grouped_p2p_submission_calls <=
+              timing.communication_calls);
+        CHECK(timing.grouped_p2p_submission_seconds >= 0.0);
+        CHECK(timing.nccl_group_end_seconds >= 0.0);
+        CHECK(timing.post_group_end_event_recapture_seconds >= 0.0);
+        CHECK(timing.communication_wait_seconds >= 0.0);
+        timing.reset();
+        CHECK(timing.communication_calls == 0);
+        CHECK(timing.pre_communication_fence_calls == 0);
+        CHECK(timing.mpi_manager_safety_fence_calls == 0);
+        CHECK(timing.grouped_p2p_submission_calls == 0);
+        CHECK(timing.nccl_group_end_calls == 0);
+        CHECK(timing.post_group_end_event_recapture_calls == 0);
+        CHECK(timing.pre_communication_fence_seconds == 0.0);
+        CHECK(timing.mpi_manager_safety_fence_seconds == 0.0);
+        CHECK(timing.grouped_p2p_submission_seconds == 0.0);
+        CHECK(timing.nccl_group_end_seconds == 0.0);
+        CHECK(timing.post_group_end_event_recapture_seconds == 0.0);
+        CHECK(timing.communication_wait_seconds == 0.0);
     }
 
     SECTION("Sendrecv 0-1 2-3") {
@@ -112,6 +148,71 @@ TEMPLATE_TEST_CASE("MPIManagerKokkos::Sendrecv", "[MPIManagerKokkos]", float,
             CHECK(h_recvBuf[i].imag() == static_cast<PrecisionT>(0));
         }
     }
+
+#ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+    SECTION("Grouped RCCL completion makes receive visible on an independent HIP stream") {
+        // This is large enough to keep the independent consumer meaningful
+        // while remaining small relative to the allocated MI300X memory.
+        constexpr std::size_t message_size = std::size_t{1} << 22;
+        const std::size_t dest = mpi_rank ^ 1U;
+        const std::size_t source = dest;
+        const PrecisionT source_base = static_cast<PrecisionT>(source * 17U);
+
+        Kokkos::View<cp_t *> sendBuf("grouped_send", message_size);
+        Kokkos::View<cp_t *> recvBuf("grouped_recv", message_size);
+        Kokkos::parallel_for(
+            "init_grouped_send", message_size, KOKKOS_LAMBDA(const std::size_t i) {
+                sendBuf(i) = cp_t{static_cast<PrecisionT>(mpi_rank * 17U + i % 113U),
+                                  static_cast<PrecisionT>(0)};
+            });
+        Kokkos::fence();
+
+        hipStream_t verify_stream{nullptr};
+        REQUIRE(hipStreamCreateWithFlags(&verify_stream, hipStreamNonBlocking) ==
+                hipSuccess);
+        {
+            Kokkos::HIP verify_exec{verify_stream};
+            Kokkos::View<std::size_t, Kokkos::HIPSpace> mismatches(
+                "grouped_receive_mismatches");
+            Kokkos::deep_copy(verify_exec, mismatches, std::size_t{0});
+            verify_exec.fence();
+
+            MPIManagerKokkos::SendrecvTiming timing{};
+            mpi_manager.Sendrecv(sendBuf, dest, recvBuf, source, message_size,
+                                 0, &timing);
+
+            // There is intentionally no default-stream fence or host copy
+            // between Sendrecv and this kernel. The wait inside Sendrecv must
+            // already make the received data visible to this nonblocking,
+            // otherwise independent HIP stream.
+            Kokkos::parallel_for(
+                "verify_grouped_receive",
+                Kokkos::RangePolicy<Kokkos::HIP>(verify_exec, 0, message_size),
+                KOKKOS_LAMBDA(const std::size_t i) {
+                    const auto expected =
+                        static_cast<PrecisionT>(source_base + i % 113U);
+                    if (recvBuf(i).real() != expected ||
+                        recvBuf(i).imag() != static_cast<PrecisionT>(0)) {
+                        Kokkos::atomic_inc(&mismatches());
+                    }
+                });
+            verify_exec.fence();
+
+            const auto host_mismatches =
+                Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
+                                                    mismatches);
+            CHECK(host_mismatches() == 0);
+            CHECK(timing.communication_calls == 1);
+            CHECK(timing.grouped_p2p_submission_calls == 1);
+            CHECK(timing.nccl_group_end_calls == 1);
+            CHECK(timing.post_group_end_event_recapture_calls == 1);
+            CHECK(timing.grouped_p2p_submission_seconds >= 0.0);
+            CHECK(timing.nccl_group_end_seconds >= 0.0);
+            CHECK(timing.post_group_end_event_recapture_seconds >= 0.0);
+        }
+        REQUIRE(hipStreamDestroy(verify_stream) == hipSuccess);
+    }
+#endif
 }
 
 TEMPLATE_TEST_CASE("MPIManagerKokkos::AllGatherV", "[MPIManagerKokkos]", float,

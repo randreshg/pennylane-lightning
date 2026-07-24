@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <complex>
 #include <memory>
 #include <mpi.h>
@@ -103,6 +104,54 @@ class MPIManagerKokkos final : public MPIManager {
 
   public:
     /**
+     * @brief Host-side timing recorded by an instrumented Sendrecv call.
+     *
+     * `pre_communication_fence_seconds` and its call count retain the v2
+     * interface for the unscoped Kokkos safety fence immediately before
+     * posting device transfers. The v3
+     * `mpi_manager_safety_fence_{seconds,calls}` fields attribute that same
+     * existing fence explicitly. It is dependency/drain time and can include
+     * work queued before the immediately preceding pack submission; it is not
+     * a raw pack completion or network measurement.
+     * `communication_wait_seconds` covers rank-local end-to-end P2P
+     * completion after request submission: the two KokkosComm waits on a GPU
+     * transport or MPI_Sendrecv on the MPI transport. It can include peer
+     * arrival, scheduling/progress, and data movement, so it is not raw wire
+     * time or achieved fabric bandwidth. The timing deliberately excludes any
+     * caller-owned pack and unpack submission work.
+     * `grouped_p2p_submission_seconds` covers host work through
+     * ncclGroupStart() and the paired KokkosComm send/recv posts,
+     * `nccl_group_end_seconds` covers the explicit GroupEnd call, and
+     * `post_group_end_event_recapture_seconds` covers the two required request
+     * event recaptures after GroupEnd. They are host API/submission timers,
+     * not device execution or wire-transfer measurements. All three remain
+     * zero on the MPI transport, which does not have grouped GPU P2P phases.
+     *
+     * A caller owns this structure and may reuse it to accumulate multiple
+     * calls. Passing `nullptr` leaves the Sendrecv execution path unchanged.
+     */
+    struct SendrecvTiming {
+        std::size_t pre_communication_fence_calls{0};
+        std::size_t mpi_manager_safety_fence_calls{0};
+        // The following three fields are populated only by the explicit GPU
+        // grouped-P2P path. They intentionally remain zero for the MPI
+        // KokkosComm path, whose blocking MPI_Sendrecv has no GroupEnd or
+        // request-event recapture phase.
+        std::size_t grouped_p2p_submission_calls{0};
+        std::size_t nccl_group_end_calls{0};
+        std::size_t post_group_end_event_recapture_calls{0};
+        std::size_t communication_calls{0};
+        double pre_communication_fence_seconds{0.0};
+        double mpi_manager_safety_fence_seconds{0.0};
+        double grouped_p2p_submission_seconds{0.0};
+        double nccl_group_end_seconds{0.0};
+        double post_group_end_event_recapture_seconds{0.0};
+        double communication_wait_seconds{0.0};
+
+        void reset() { *this = {}; }
+    };
+
+    /**
      * @brief Maximum element count for a single MPI transfer.
      *
      * MPI-3 counts are `int`, so this stays below INT_MAX (2^30 < 2^31 - 1)
@@ -169,7 +218,8 @@ class MPIManagerKokkos final : public MPIManager {
     template <typename T>
     void Sendrecv(Kokkos::View<T *> &sendBuf, std::size_t dest,
                   Kokkos::View<T *> &recvBuf, std::size_t source,
-                  std::size_t size, std::size_t tag = 0) {
+                  std::size_t size, std::size_t tag = 0,
+                  SendrecvTiming *timing = nullptr) {
 #ifdef _ENABLE_PLKOKKOS_KOKKOSCOMM
         // KokkosComm path: uses send+recv which can go through
         // NCCL/RCCL on GPU backends for direct device-to-device transfers.
@@ -179,10 +229,36 @@ class MPIManagerKokkos final : public MPIManager {
         // The tag parameter is only used in the MPI-only path.
         static_cast<void>(tag);
 
-        // Ensure all prior Kokkos operations complete before communication
-        Kokkos::fence();
+        // Ensure all prior Kokkos operations complete before communication.
+        // Keep this fence in place: the caller may already have fenced its
+        // pack kernel, but this is the transport's independent safety fence.
+        if (timing != nullptr) {
+            const auto pre_communication_fence_start =
+                std::chrono::steady_clock::now();
+            Kokkos::fence();
+            const double pre_communication_fence_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    pre_communication_fence_start)
+                    .count();
+            timing->pre_communication_fence_calls++;
+            timing->mpi_manager_safety_fence_calls++;
+            timing->pre_communication_fence_seconds +=
+                pre_communication_fence_seconds;
+            timing->mpi_manager_safety_fence_seconds +=
+                pre_communication_fence_seconds;
+        } else {
+            Kokkos::fence();
+        }
 
 #ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+        // This host timer covers all work that posts the grouped P2P pair,
+        // including construction of the KokkosComm handle/subviews,
+        // ncclGroupStart(), and KokkosComm::send/recv. GroupEnd and the
+        // post-GroupEnd request-event repair are measured separately below.
+        const auto grouped_p2p_submission_start =
+            timing != nullptr ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         // Use Kokkos::HIP with dedicated stream for RCCL operations
         Kokkos::HIP space(gpu_stream_);
         auto handle = KokkosComm::Handle<Kokkos::HIP,
@@ -211,13 +287,67 @@ class MPIManagerKokkos final : public MPIManager {
         auto recv_req = KokkosComm::recv(handle, rv, static_cast<int>(source));
 
 #ifdef PLKOKKOS_HAS_KOKKOSCOMM_GPU_BACKEND
+        if (timing != nullptr) {
+            timing->grouped_p2p_submission_calls++;
+            timing->grouped_p2p_submission_seconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    grouped_p2p_submission_start)
+                    .count();
+        }
+
+        const auto nccl_group_end_start =
+            timing != nullptr ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         res = ncclGroupEnd();
         PL_ABORT_IF(res != ncclSuccess, ncclGetErrorString(res));
+        if (timing != nullptr) {
+            timing->nccl_group_end_calls++;
+            timing->nccl_group_end_seconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - nccl_group_end_start)
+                    .count();
+        }
+
+        // KokkosComm::send/recv initially capture their request events while
+        // the group is open. RCCL defers all grouped work until GroupEnd, so
+        // those events can otherwise precede the actual transport. Recapture
+        // both completion events after GroupEnd has enqueued the fused P2P
+        // operation; this makes wait() a real receive-visibility boundary on
+        // every caller stream, in both timed and production paths.
+        const auto request_recapture_start =
+            timing != nullptr ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+        send_req.capture_stream_state(gpu_stream_);
+        recv_req.capture_stream_state(gpu_stream_);
+        if (timing != nullptr) {
+            timing->post_group_end_event_recapture_calls++;
+            timing->post_group_end_event_recapture_seconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    request_recapture_start)
+                    .count();
+        }
 #endif
 
-        // Wait for both operations
-        KokkosComm::wait(std::move(send_req));
-        KokkosComm::wait(std::move(recv_req));
+        // Wait for both operations. This is the rank-local end-to-end P2P
+        // completion phase after request submission; it is not a raw-wire
+        // transfer timer.
+        if (timing != nullptr) {
+            const auto communication_wait_start =
+                std::chrono::steady_clock::now();
+            KokkosComm::wait(std::move(send_req));
+            KokkosComm::wait(std::move(recv_req));
+            timing->communication_calls++;
+            timing->communication_wait_seconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    communication_wait_start)
+                    .count();
+        } else {
+            KokkosComm::wait(std::move(send_req));
+            KokkosComm::wait(std::move(recv_req));
+        }
 #else
         MPI_Datatype datatype = getMPIDatatype<T>();
         PL_ABORT_IF(size > MPI_MAX_TRANSFER_COUNT,
@@ -230,9 +360,25 @@ class MPIManagerKokkos final : public MPIManager {
         int destInt = static_cast<int>(dest);
         int sourceInt = static_cast<int>(source);
         int sizeInt = static_cast<int>(size);
-        PL_MPI_IS_SUCCESS(MPI_Sendrecv(
-            sendBuf.data(), sizeInt, datatype, destInt, sendtag, recvBuf.data(),
-            sizeInt, datatype, sourceInt, recvtag, this->getComm(), &status));
+        if (timing != nullptr) {
+            const auto communication_wait_start =
+                std::chrono::steady_clock::now();
+            PL_MPI_IS_SUCCESS(MPI_Sendrecv(
+                sendBuf.data(), sizeInt, datatype, destInt, sendtag,
+                recvBuf.data(), sizeInt, datatype, sourceInt, recvtag,
+                this->getComm(), &status));
+            timing->communication_calls++;
+            timing->communication_wait_seconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    communication_wait_start)
+                    .count();
+        } else {
+            PL_MPI_IS_SUCCESS(MPI_Sendrecv(
+                sendBuf.data(), sizeInt, datatype, destInt, sendtag,
+                recvBuf.data(), sizeInt, datatype, sourceInt, recvtag,
+                this->getComm(), &status));
+        }
 #endif
     }
 

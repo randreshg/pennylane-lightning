@@ -42,7 +42,7 @@ try:
 except ImportError as ex:
     warn(str(ex), UserWarning)
 
-from typing import Union
+from typing import Any, Union
 
 import numpy as np
 import pennylane as qp
@@ -153,6 +153,28 @@ class LightningKokkosStateVector(LightningBaseStateVector):
             return StateVectorMPIC128 if self.dtype == np.complex128 else StateVectorMPIC64
 
         return StateVectorC128 if self.dtype == np.complex128 else StateVectorC64
+
+    def set_distributed_exchange_metrics_enabled(self, enabled: bool) -> None:
+        """Enable or disable rank-local distributed-exchange instrumentation.
+
+        This diagnostic is available only for MPI state vectors. It is disabled
+        by default and has no effect on non-MPI execution.
+        """
+        if not self._mpi:
+            raise RuntimeError("Distributed-exchange metrics require mpi=True.")
+        self._qubit_state.setDistributedExchangeMetricsEnabled(enabled)
+
+    def reset_distributed_exchange_metrics(self) -> None:
+        """Clear rank-local distributed-exchange timing and counters."""
+        if not self._mpi:
+            raise RuntimeError("Distributed-exchange metrics require mpi=True.")
+        self._qubit_state.resetDistributedExchangeMetrics()
+
+    def get_distributed_exchange_metrics(self) -> dict[str, Any]:
+        """Return rank-local distributed-exchange timing, counters, and records."""
+        if not self._mpi:
+            raise RuntimeError("Distributed-exchange metrics require mpi=True.")
+        return dict(self._qubit_state.getDistributedExchangeMetrics())
 
     def sync_h2d(self, state_vector):
         """Copy the state vector data on host provided by the user to the state
